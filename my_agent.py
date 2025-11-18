@@ -17,8 +17,8 @@ class MyAgent(MyLSVMAgent):
     def setup(self):
         # TODO: Fill out with anything you want to initialize each auction
         self.epsilon = 0.1
-        self.national_aggressiveness = 0.8
-        self.regional_aggressiveness = 1.0
+        self.national_aggressiveness = 1.5
+        self.regional_aggressiveness = 1.5
         self.max_bid_factor = 1.0
         self.last_bids = {}
 
@@ -51,7 +51,7 @@ class MyAgent(MyLSVMAgent):
                 continue
             new_bundle = best_bundle | {g}
             new_utility = self.calc_total_utility(bundle=new_bundle)
-            if new_utility > best_utility + 1e-9:
+            if new_utility > best_utility + 1e-3:
                 best_bundle = new_bundle
                 best_utility = new_utility
 

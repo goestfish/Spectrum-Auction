@@ -8,6 +8,7 @@ import os
 import random
 import gzip
 import json
+import pickle
 from path_utils import path_from_local_root
 from collections import defaultdict
 from independent_histogram import IndependentHistogram
@@ -17,72 +18,115 @@ NAME = "???"  # TODO: Please give your agent a NAME
 
 
 class MyAgent(MyLSVMAgent):
+    PRETRAINED_HIST = None
+    HIST_FILENAME = "lsvm_hist.pkl"
+
     def setup(self):
         # TODO: Fill out with anything you want to initialize each auction
         goods = sorted(list(self.get_goods()))
-        self.BUCKET_SIZE = 1.0
-        self.BID_UPPER_BOUND = 50.0
-        bucket_sizes = [self.BUCKET_SIZE] * len(goods)
-        max_bids = [self.BID_UPPER_BOUND] * len(goods)
-        self.price_distribution = IndependentHistogram(goods, bucket_sizes, max_bids)
-        self.NUM_PREDICT_SAMPLES = 30
-        self.epsilon = 0.1
+        if not hasattr(self, "price_distribution"):
+            self.BUCKET_SIZE = 1
+            self.BID_UPPER_BOUND = 200
+
+        if MyAgent.PRETRAINED_HIST is None:
+            hist_path = path_from_local_root(MyAgent.HIST_FILENAME)
+            if os.path.exists(hist_path):
+                with open(hist_path, "rb") as f:
+                    MyAgent.PRETRAINED_HIST = pickle.load(f)
+                print(f"[MyAgent] Loaded pretrained histogram from {hist_path}")
+            else:
+                bucket_sizes = [self.BUCKET_SIZE] * len(goods)
+                max_bids = [self.BID_UPPER_BOUND] * len(goods)
+                MyAgent.PRETRAINED_HIST = IndependentHistogram(goods, bucket_sizes, max_bids)
+                print(f"[MyAgent] No pretrained histogram found, using fresh histogram.")
+
+        self.price_distribution = MyAgent.PRETRAINED_HIST
+        self.NUM_LOCALBID_ITER = 3
+        self.NUM_SAMPLES = 30
+        self.ALPHA = 0.2
+
         self.last_bids = {}
 
+    # scpp
+    def _valuation_function(self, bundle: set[str]) -> float:
+        return float(self.calc_total_valuation(bundle=bundle))
 
-    #scpp
-    def _predict_prices(self):
-        goods = self.get_goods()
-        acc = {g: 0.0 for g in goods}
-        for _ in range(self.NUM_PREDICT_SAMPLES):
-            sample = self.price_distribution.sample()   # 来自 IndependentHistogram
-            for g in goods:
-                acc[g] += sample[g]
-        predicted = {g: acc[g] / self.NUM_PREDICT_SAMPLES for g in goods}
-        return predicted
+    def _calculate_marginal_value(self,
+                                  goods: set[str],
+                                  selected_good: str,
+                                  valuation_function,
+                                  bids: dict,
+                                  prices: dict) -> float:
 
-    def _choose_bundle(self, candidate_goods, predicted_prices):
-        bundle = set(self.get_tentative_allocation())
-        best_u = self.calc_total_utility(bundle=bundle)
+        won_goods = {
+            g for g in goods
+            if g != selected_good and bids.get(g, 0.0) >= prices.get(g, 0.0)
+        }
 
-        improvements = []
-        for g in candidate_goods:
-            if g in bundle:
-                continue
-            new_bundle = bundle | {g}
-            du = self.calc_total_utility(bundle=new_bundle) - best_u
-            improvements.append((du, g))
+        valuation_without = valuation_function(won_goods)
+        won_goods_with = set(won_goods)
+        won_goods_with.add(selected_good)
+        valuation_with = valuation_function(won_goods_with)
 
-        improvements.sort(reverse=True, key=lambda x: x[0])
+        return float(valuation_with - valuation_without)
 
-        for du, g in improvements:
-            if du <= 1e-6:
-                continue
-            new_bundle = bundle | {g}
-            new_u = self.calc_total_utility(bundle=new_bundle)
-            if new_u > best_u + 1e-9:
-                bundle = new_bundle
-                best_u = new_u
+    def _calculate_expected_marginal_value(self,
+                                           goods,
+                                           selected_good: str,
+                                           valuation_function,
+                                           bids: dict,
+                                           num_samples: int) -> float:
+        if num_samples <= 0:
+            return 0.0
 
-        return bundle
+        if not isinstance(goods, set):
+            goods = set(goods)
 
-    def _bundle_to_bids(self, bundle, predicted_prices):
-        min_bids = self.get_min_bids()
-        vals = self.get_valuations()
+        total_mv = 0.0
+        for _ in range(num_samples):
+            sampled_prices = self.price_distribution.sample()  # dict[str, float]
 
-        bids = {}
-        for g in bundle:
-            v = vals[g]
-            mb = min_bids[g]
-            p_hat = predicted_prices[g]
-            target = mb + 0.5 * max(p_hat - mb, 0.0)
-            cap = 1.5 * v
-            bid = min(max(target, mb + self.epsilon), cap)
-            bids[g] = bid
+            mv = self._calculate_marginal_value(
+                goods=goods,
+                selected_good=selected_good,
+                valuation_function=valuation_function,
+                bids=bids,
+                prices=sampled_prices,
+            )
+            total_mv += mv
 
-        return bids
+        avg_mv = total_mv / float(num_samples)
+        return float(avg_mv)
 
-    def _make_valid(self, bids):
+    def _expected_local_bid(self, goods) -> dict:
+
+        if not isinstance(goods, set):
+            goods = set(goods)
+
+        v = self._valuation_function
+
+        bold: dict[str, float] = {}
+        for g in goods:
+            bold[g] = float(v({g}))
+
+        for _ in range(self.NUM_LOCALBID_ITER):
+            bnew = bold.copy()
+            for gk in goods:
+                amv = self._calculate_expected_marginal_value(
+                    goods=goods,
+                    selected_good=gk,
+                    valuation_function=v,
+                    bids=bold,
+                    num_samples=self.NUM_SAMPLES,
+                )
+                bnew[gk] = float(amv)
+
+            bold = bnew
+
+        return bold
+
+    def _make_valid(self, bids: dict) -> dict:
+
         bids = self.clip_bids(bids)
         if self.is_valid_bid_bundle(bids):
             self.last_bids = bids
@@ -93,6 +137,7 @@ class MyAgent(MyLSVMAgent):
         except Exception:
             prev = self.last_bids or {}
         prev = self.clip_bids(prev)
+
         if prev and self.is_valid_bid_bundle(prev):
             self.last_bids = prev
             return prev
@@ -110,19 +155,15 @@ class MyAgent(MyLSVMAgent):
 
     def national_bidder_strategy(self):
         # TODO: Fill out with your national bidder strategy
-        predicted = self._predict_prices()
         goods = self.get_goods()
-        bundle = self._choose_bundle(goods, predicted)
-        bids = self._bundle_to_bids(bundle, predicted)
-        return self._make_valid(bids)
+        raw_bids = self._expected_local_bid(goods)
+        return self._make_valid(raw_bids)
 
     def regional_bidder_strategy(self):
         # TODO: Fill out with your regional bidder strategy
-        predicted = self._predict_prices()
         goods = self.get_goods_in_proximity()
-        bundle = self._choose_bundle(goods, predicted)
-        bids = self._bundle_to_bids(bundle, predicted)
-        return self._make_valid(bids)
+        raw_bids = self._expected_local_bid(goods)
+        return self._make_valid(raw_bids)
 
     def get_bids(self):
         if self.is_national_bidder():
@@ -132,15 +173,14 @@ class MyAgent(MyLSVMAgent):
 
     def update(self):
         # TODO: Fill out with anything you want to update each round
-        pass
+        try:
+            self.last_util = self.get_previous_util()
+        except Exception:
+            self.last_util = None
 
     def teardown(self):
         # TODO: Fill out with anything you want to run at the end of each auction
-        try:
-            final_prices = self.get_price_history_map()[-1]
-            self.price_distribution.add_record(final_prices)
-        except Exception:
-            pass
+        pass
 
     ################### SUBMISSION #####################
 
@@ -149,6 +189,42 @@ my_agent_submission = MyAgent(NAME)
 
 
 ####################################################
+
+def build_histogram_from_logs(saved_dir: str, output_filename: str = "lsvm_hist.pkl"):
+    saved_path = path_from_local_root(saved_dir)
+    if not os.path.isdir(saved_path):
+        print(f"[OfflineTrain] Directory not found: {saved_path}")
+        return
+
+    files = [f for f in os.listdir(saved_path) if f.endswith(".json.gz")]
+    if not files:
+        print(f"[OfflineTrain] No .json.gz files found in {saved_path}")
+        return
+    first_file = os.path.join(saved_path, files[0])
+    with gzip.open(first_file, "rt", encoding="UTF-8") as f:
+        game_data = json.load(f)
+    any_agent_data = next(iter(game_data.values()))
+    final_prices = any_agent_data["price_history"][-1]
+    goods = sorted(list(final_prices.keys()))
+
+    BUCKET_SIZE = 1
+    BID_UPPER_BOUND = 50
+    bucket_sizes = [BUCKET_SIZE] * len(goods)
+    max_bids = [BID_UPPER_BOUND] * len(goods)
+
+    hist = IndependentHistogram(goods, bucket_sizes, max_bids)
+    for fname in files:
+        fpath = os.path.join(saved_path, fname)
+        with gzip.open(fpath, "rt", encoding="UTF-8") as f:
+            game_data = json.load(f)
+        any_agent_data = next(iter(game_data.values()))
+        final_prices = any_agent_data["price_history"][-1]
+        hist.add_record(final_prices)
+
+    out_path = path_from_local_root(output_filename)
+    with open(out_path, "wb") as f:
+        pickle.dump(hist, f)
+    print(f"[OfflineTrain] Saved histogram to {out_path}, from {len(files)} games.")
 
 
 def process_saved_game(filepath):
@@ -208,25 +284,33 @@ if __name__ == "__main__":
     # process_saved_game(path_from_local_root("saved_games/2024-04-08_17-36-34.json.gz"))
     # or every file in a directory
     # process_saved_dir(path_from_local_root("saved_games"))
+    MODE = "test"
 
-    ### DO NOT TOUCH THIS #####
-    agent = MyAgent(NAME)
-    arena = LSVMArena(
-        num_cycles_per_player=3,
-        timeout=1,
-        local_save_path="saved_games",
-        players=[
-            agent,
-            MyAgent("CP - MyAgent"),
-            MyAgent("CP2 - MyAgent"),
-            MyAgent("CP3 - MyAgent"),
-            MinBidAgent("Min Bidder"),
-            JumpBidder("Jump Bidder"),
-            TruthfulBidder("Truthful Bidder"),
-        ]
-    )
+    if MODE == "train":
+        build_histogram_from_logs(saved_dir="saved_games", output_filename=MyAgent.HIST_FILENAME)
 
-    start = time.time()
-    arena.run()
-    end = time.time()
-    print(f"{end - start} Seconds Elapsed")
+    elif MODE == "test":
+        ### DO NOT TOUCH THIS #####
+        agent = MyAgent(NAME)
+        arena = LSVMArena(
+            num_cycles_per_player=1,
+            timeout=1,
+            local_save_path="saved_games",
+            players=[
+                agent,
+                MyAgent("CP - MyAgent"),
+                MyAgent("CP2 - MyAgent"),
+                MyAgent("CP3 - MyAgent"),
+                MinBidAgent("Min Bidder"),
+                JumpBidder("Jump Bidder"),
+                TruthfulBidder("Truthful Bidder"),
+            ]
+        )
+
+        start = time.time()
+        arena.run()
+        end = time.time()
+        print(f"{end - start} Seconds Elapsed")
+
+    else:
+        print(f"Unknown MODE = {MODE}, nothing to do.")
