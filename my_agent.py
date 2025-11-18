@@ -17,17 +17,16 @@ class MyAgent(MyLSVMAgent):
     def setup(self):
         # TODO: Fill out with anything you want to initialize each auction
         self.epsilon = 0.1
-        self.national_aggressiveness = 0.6
-        self.regional_aggressiveness = 0.8
-        self.max_bid_factor = 2.0
+        self.national_aggressiveness = 0.8
+        self.regional_aggressiveness = 1.0
+        self.max_bid_factor = 1.0
         self.last_bids = {}
 
     def _estimate_surplus(self, good, valuations, min_bids):
 
         v = valuations.get(good, 0.0)
         mb = min_bids.get(good, 0.0)
-        approx_price = mb - self.epsilon
-        return max(0.0, v - approx_price)
+        return max(0.0, v - mb)
 
     def _choose_bundle_greedy(self, candidate_goods):
 
@@ -65,15 +64,20 @@ class MyAgent(MyLSVMAgent):
             v = float(valuations.get(g, 0.0))
             mb = float(min_bids.get(g, 0.0))
 
-            surplus = self._estimate_surplus(g, valuations, min_bids)
+            surplus = max(0.0, v - mb)
+
+            if surplus <= 0:
+                continue
+
             jump = aggressiveness * surplus
 
             raw_bid = mb + jump
 
             cap = self.max_bid_factor * max(v, 1.0)
-            bid = min(raw_bid, cap)
 
-            bids[g] = max(bid, mb)
+            bid = max(mb + self.epsilon, min(raw_bid, cap))
+
+            bids[g] = bid
 
         return bids
 
