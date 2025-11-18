@@ -15,7 +15,6 @@ NAME = "???"  # TODO: Please give your agent a NAME
 
 class MyAgent(MyLSVMAgent):
     def setup(self):
-        # TODO: Fill out with anything you want to initialize each auction
         self.epsilon = 0.1
         self.national_aggressiveness = 1.5
         self.regional_aggressiveness = 1.5
@@ -23,66 +22,72 @@ class MyAgent(MyLSVMAgent):
         self.last_bids = {}
 
     def _estimate_surplus(self, good, valuations, min_bids):
-
         v = valuations.get(good, 0.0)
         mb = min_bids.get(good, 0.0)
         return max(0.0, v - mb)
 
-    def _choose_bundle_greedy(self, candidate_goods):
+    def _dynamic_aggressiveness(self):
+        try:
+            prices = self.get_current_prices()
+            prev_prices = self.get_previous_price_map()
 
-        current_alloc = set(self.get_tentative_allocation())
-        candidate_goods = set(candidate_goods)
+            increases = [prices[g] - prev_prices.get(g, prices[g]) for g in prices]
+            avg_inc = sum(increases) / len(increases)
+
+            if avg_inc < self.epsilon * 2:
+                return 2.0
+            else:
+                return 0.7
+        except:
+            return 1.5
+
+    def _choose_bundle(self, candidate_goods):
 
         valuations = self.get_valuations()
         min_bids = self.get_min_bids()
+        current_alloc = set(self.get_tentative_allocation())
+
+        surplus_list = [(self._estimate_surplus(g, valuations, min_bids), g) for g in candidate_goods]
+        surplus_list = [x for x in surplus_list if x[0] > 0]
+        surplus_list.sort(reverse=True)
+
+        core_candidates = [g for _, g in surplus_list[:6]]
 
         best_bundle = set(current_alloc)
-        best_utility = self.calc_total_utility(bundle=best_bundle)
+        best_utility = self.calc_total_utility(best_bundle)
 
-        scored_goods = []
-        for g in (candidate_goods - best_bundle):
-            surplus = self._estimate_surplus(g, valuations, min_bids)
-            scored_goods.append((surplus, g))
-
-        scored_goods.sort(reverse=True)
-
-        for surplus, g in scored_goods:
-            if surplus <= 0:
-                continue
-            new_bundle = best_bundle | {g}
-            new_utility = self.calc_total_utility(bundle=new_bundle)
-            if new_utility > best_utility + 1e-3:
-                best_bundle = new_bundle
-                best_utility = new_utility
+        from itertools import combinations
+        for r in range(1, len(core_candidates) + 1):
+            for comb in combinations(core_candidates, r):
+                bundle = current_alloc | set(comb)
+                utility = self.calc_total_utility(bundle)
+                if utility > best_utility + 1e-9:
+                    best_bundle = set(bundle)
+                    best_utility = utility
 
         return best_bundle, valuations, min_bids
 
     def _bundle_to_bids(self, bundle, valuations, min_bids, aggressiveness):
-
         bids = {}
         for g in bundle:
             v = float(valuations.get(g, 0.0))
             mb = float(min_bids.get(g, 0.0))
 
             surplus = max(0.0, v - mb)
-
             if surplus <= 0:
                 continue
 
             jump = aggressiveness * surplus
-
             raw_bid = mb + jump
 
             cap = self.max_bid_factor * max(v, 1.0)
 
             bid = max(mb + self.epsilon, min(raw_bid, cap))
-
             bids[g] = bid
 
         return bids
 
     def _make_valid_bids(self, proposed_bids):
-
         if proposed_bids is None:
             proposed_bids = {}
 
@@ -115,7 +120,6 @@ class MyAgent(MyLSVMAgent):
         return {}
 
     def national_bidder_strategy(self):
-        # TODO: Fill out with your national bidder strategy
         goods = self.get_goods()
         bundle, valuations, min_bids = self._choose_bundle_greedy(goods)
         proposed_bids = self._bundle_to_bids(
@@ -124,10 +128,8 @@ class MyAgent(MyLSVMAgent):
         return self._make_valid_bids(proposed_bids)
 
     def regional_bidder_strategy(self):
-        # TODO: Fill out with your regional bidder strategy
         candidate_goods = set(self.get_goods_in_proximity())
-
-        bundle, valuations, min_bids = self._choose_bundle_greedy(candidate_goods)
+        bundle, valuations, min_bids = self._choose_bundle(candidate_goods)
         proposed_bids = self._bundle_to_bids(
             bundle, valuations, min_bids, self.regional_aggressiveness
         )
@@ -135,20 +137,24 @@ class MyAgent(MyLSVMAgent):
 
     def get_bids(self):
         if self.is_national_bidder():
-            return self.national_bidder_strategy()
+            bundle, valuations, min_bids = self._choose_bundle(self.get_goods())
         else:
-            return self.regional_bidder_strategy()
+            bundle, valuations, min_bids = self._choose_bundle(set(self.get_goods_in_proximity()))
+
+        dynamic_aggr = self._dynamic_aggressiveness()
+
+        proposed = self._bundle_to_bids(bundle, valuations, min_bids, dynamic_aggr)
+        return self._make_valid_bids(proposed)
 
     def update(self):
-        # TODO: Fill out with anything you want to update each round
         try:
             self.last_util = self.get_previous_util()
         except Exception:
             self.last_util = None
 
     def teardown(self):
-        # TODO: Fill out with anything you want to run at the end of each auction
         pass
+
 
     ################### SUBMISSION #####################
 
