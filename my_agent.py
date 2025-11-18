@@ -27,6 +27,7 @@ class MyAgent(MyLSVMAgent):
         if not hasattr(self, "price_distribution"):
             self.BUCKET_SIZE = 1
             self.BID_UPPER_BOUND = 200
+            self.has_pretrained = False
 
         if MyAgent.PRETRAINED_HIST is None:
             hist_path = path_from_local_root(MyAgent.HIST_FILENAME)
