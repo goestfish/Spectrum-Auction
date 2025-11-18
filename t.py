@@ -9,6 +9,9 @@ import random
 import gzip
 import json
 from path_utils import path_from_local_root
+from collections import defaultdict
+from independent_histogram import IndependentHistogram
+from single_good_histogram import SingleGoodHistogram
 
 NAME = "???"  # TODO: Please give your agent a NAME
 
@@ -16,118 +19,110 @@ NAME = "???"  # TODO: Please give your agent a NAME
 class MyAgent(MyLSVMAgent):
     def setup(self):
         # TODO: Fill out with anything you want to initialize each auction
+        goods = sorted(list(self.get_goods()))
+        self.BUCKET_SIZE = 1.0
+        self.BID_UPPER_BOUND = 50.0
+        bucket_sizes = [self.BUCKET_SIZE] * len(goods)
+        max_bids = [self.BID_UPPER_BOUND] * len(goods)
+        self.price_distribution = IndependentHistogram(goods, bucket_sizes, max_bids)
+        self.NUM_PREDICT_SAMPLES = 30
         self.epsilon = 0.1
-        self.national_aggressiveness = 0.6
-        self.regional_aggressiveness = 0.8
-        self.max_bid_factor = 2.0
         self.last_bids = {}
 
-    def _estimate_surplus(self, good, valuations, min_bids):
 
-        v = valuations.get(good, 0.0)
-        mb = min_bids.get(good, 0.0)
-        approx_price = mb - self.epsilon
-        return max(0.0, v - approx_price)
+    #scpp
+    def _predict_prices(self):
+        goods = self.get_goods()
+        acc = {g: 0.0 for g in goods}
+        for _ in range(self.NUM_PREDICT_SAMPLES):
+            sample = self.price_distribution.sample()   # 来自 IndependentHistogram
+            for g in goods:
+                acc[g] += sample[g]
+        predicted = {g: acc[g] / self.NUM_PREDICT_SAMPLES for g in goods}
+        return predicted
 
-    def _choose_bundle_greedy(self, candidate_goods):
+    def _choose_bundle(self, candidate_goods, predicted_prices):
+        bundle = set(self.get_tentative_allocation())
+        best_u = self.calc_total_utility(bundle=bundle)
 
-        current_alloc = set(self.get_tentative_allocation())
-        candidate_goods = set(candidate_goods)
-
-        valuations = self.get_valuations()
-        min_bids = self.get_min_bids()
-
-        best_bundle = set(current_alloc)
-        best_utility = self.calc_total_utility(bundle=best_bundle)
-
-        scored_goods = []
-        for g in (candidate_goods - best_bundle):
-            surplus = self._estimate_surplus(g, valuations, min_bids)
-            scored_goods.append((surplus, g))
-
-        scored_goods.sort(reverse=True)
-
-        for surplus, g in scored_goods:
-            if surplus <= 0:
+        improvements = []
+        for g in candidate_goods:
+            if g in bundle:
                 continue
-            new_bundle = best_bundle | {g}
-            new_utility = self.calc_total_utility(bundle=new_bundle)
-            if new_utility > best_utility + 1e-9:
-                best_bundle = new_bundle
-                best_utility = new_utility
+            new_bundle = bundle | {g}
+            du = self.calc_total_utility(bundle=new_bundle) - best_u
+            improvements.append((du, g))
 
-        return best_bundle, valuations, min_bids
+        improvements.sort(reverse=True, key=lambda x: x[0])
 
-    def _bundle_to_bids(self, bundle, valuations, min_bids, aggressiveness):
+        for du, g in improvements:
+            if du <= 1e-6:
+                continue
+            new_bundle = bundle | {g}
+            new_u = self.calc_total_utility(bundle=new_bundle)
+            if new_u > best_u + 1e-9:
+                bundle = new_bundle
+                best_u = new_u
+
+        return bundle
+
+    def _bundle_to_bids(self, bundle, predicted_prices):
+        min_bids = self.get_min_bids()
+        vals = self.get_valuations()
 
         bids = {}
         for g in bundle:
-            v = float(valuations.get(g, 0.0))
-            mb = float(min_bids.get(g, 0.0))
-
-            surplus = self._estimate_surplus(g, valuations, min_bids)
-            jump = aggressiveness * surplus
-
-            raw_bid = mb + jump
-
-            cap = self.max_bid_factor * max(v, 1.0)
-            bid = min(raw_bid, cap)
-
-            bids[g] = max(bid, mb)
+            v = vals[g]
+            mb = min_bids[g]
+            p_hat = predicted_prices[g]
+            target = mb + 0.5 * max(p_hat - mb, 0.0)
+            cap = 1.5 * v
+            bid = min(max(target, mb + self.epsilon), cap)
+            bids[g] = bid
 
         return bids
 
-    def _make_valid_bids(self, proposed_bids):
-
-        if proposed_bids is None:
-            proposed_bids = {}
-
-        bids = self.clip_bids(proposed_bids)
+    def _make_valid(self, bids):
+        bids = self.clip_bids(bids)
         if self.is_valid_bid_bundle(bids):
             self.last_bids = bids
             return bids
 
-        prev_bids = {}
         try:
-            prev_bids = self.get_previous_bid_map()
+            prev = self.get_previous_bid_map()
         except Exception:
-            prev_bids = self.last_bids or {}
+            prev = self.last_bids or {}
+        prev = self.clip_bids(prev)
+        if prev and self.is_valid_bid_bundle(prev):
+            self.last_bids = prev
+            return prev
 
-        if prev_bids:
-            prev_bids = self.clip_bids(prev_bids)
-            if self.is_valid_bid_bundle(prev_bids):
-                self.last_bids = prev_bids
-                return prev_bids
-
-        current_alloc = set(self.get_tentative_allocation())
-        if current_alloc:
-            min_on_alloc = self.get_min_bids(bundle=current_alloc)
-            min_on_alloc = self.clip_bids(min_on_alloc)
-            if self.is_valid_bid_bundle(min_on_alloc):
-                self.last_bids = min_on_alloc
-                return min_on_alloc
+        alloc = set(self.get_tentative_allocation())
+        if alloc:
+            mb = self.get_min_bids(bundle=alloc)
+            mb = self.clip_bids(mb)
+            if self.is_valid_bid_bundle(mb):
+                self.last_bids = mb
+                return mb
 
         self.last_bids = {}
         return {}
 
     def national_bidder_strategy(self):
         # TODO: Fill out with your national bidder strategy
+        predicted = self._predict_prices()
         goods = self.get_goods()
-        bundle, valuations, min_bids = self._choose_bundle_greedy(goods)
-        proposed_bids = self._bundle_to_bids(
-            bundle, valuations, min_bids, self.national_aggressiveness
-        )
-        return self._make_valid_bids(proposed_bids)
+        bundle = self._choose_bundle(goods, predicted)
+        bids = self._bundle_to_bids(bundle, predicted)
+        return self._make_valid(bids)
 
     def regional_bidder_strategy(self):
         # TODO: Fill out with your regional bidder strategy
-        candidate_goods = set(self.get_goods_in_proximity())
-
-        bundle, valuations, min_bids = self._choose_bundle_greedy(candidate_goods)
-        proposed_bids = self._bundle_to_bids(
-            bundle, valuations, min_bids, self.regional_aggressiveness
-        )
-        return self._make_valid_bids(proposed_bids)
+        predicted = self._predict_prices()
+        goods = self.get_goods_in_proximity()
+        bundle = self._choose_bundle(goods, predicted)
+        bids = self._bundle_to_bids(bundle, predicted)
+        return self._make_valid(bids)
 
     def get_bids(self):
         if self.is_national_bidder():
@@ -137,14 +132,15 @@ class MyAgent(MyLSVMAgent):
 
     def update(self):
         # TODO: Fill out with anything you want to update each round
-        try:
-            self.last_util = self.get_previous_util()
-        except Exception:
-            self.last_util = None
+        pass
 
     def teardown(self):
         # TODO: Fill out with anything you want to run at the end of each auction
-        pass
+        try:
+            final_prices = self.get_price_history_map()[-1]
+            self.price_distribution.add_record(final_prices)
+        except Exception:
+            pass
 
     ################### SUBMISSION #####################
 
