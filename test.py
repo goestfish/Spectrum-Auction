@@ -436,7 +436,7 @@ class MyAgent2(MyLSVMAgent):
 
 
 ################### SUBMISSION #####################
-my_agent_submission = MyAgent2(NAME)
+my_agent_submission2 = MyAgent2(NAME)
 ####################################################
 
 
