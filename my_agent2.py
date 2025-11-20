@@ -11,6 +11,7 @@ import json
 from collections import defaultdict
 from path_utils import path_from_local_root
 from scpp import Scpp
+from my_agent import MyAgent
 
 
 NAME = "......"
@@ -24,16 +25,30 @@ class MyAgent2(MyLSVMAgent):
     EPSILON = 0.1
 
     def setup(self):
+
         self.round = 0
         self.is_national = self.is_national_bidder()
+
         self.goods = sorted(self.get_goods())
         self.shape = self.get_shape()
         self.goods_to_idx = self.get_goods_to_index()
         self.idx_to_good = {tuple(rc): g for g, rc in self.goods_to_idx.items()}
 
         self.single_vals = self.get_valuations()
-        self._build_static_price_model()
+
+        self.expected_final_price = {}
+        for g in self.goods:
+            hist = MyAgent2.PRICE_HISTORY[g]
+            if hist:
+                sorted_hist = sorted(hist)
+                q = 0.7
+                idx = int(q * (len(sorted_hist) - 1))
+                self.expected_final_price[g] = sorted_hist[idx]
+            else:
+                self.expected_final_price[g] = 0.7 * self.single_vals[g]
+
         self.aggressiveness = 1.0
+
         self.current_target_bundle = set()
 
         if self.is_national:
@@ -41,69 +56,9 @@ class MyAgent2(MyLSVMAgent):
         else:
             self.candidate_bundles = self._generate_regional_bundles()
 
-    def _build_static_price_model(self):
-        self.static_ref_price = {}
-
-        for g in self.goods:
-            hist = MyAgent2.PRICE_HISTORY[g]
-            base_v = max(float(self.single_vals.get(g, 0.0)), 0.0)
-
-            if hist:
-                h = sorted(hist)
-                n = len(h)
-
-                def q(alpha):
-                    if n == 1:
-                        return h[0]
-                    idx = int(alpha * (n - 1))
-                    return h[idx]
-
-                q50 = q(0.5)
-                q70 = q(0.7)
-                q90 = q(0.9)
-                ema = 0.7 * h[-1] + 0.3 * q50
-
-                ref = 0.4 * q50 + 0.4 * q70 + 0.2 * ema
-
-                if base_v > 0:
-                    cap_mult = 1.6 if self.is_national else 1.4
-                    ref = min(ref, cap_mult * base_v)
-
-                self.static_ref_price[g] = float(max(ref, 0.0))
-            else:
-
-                self.static_ref_price[g] = 0.8 * base_v
-
-    def _estimate_final_price(self, g, p_now):
-
-        base_v = max(float(self.single_vals.get(g, 0.0)), 0.0)
-        ref = float(self.static_ref_price.get(g, base_v))
-
-        price_hist = self.get_price_history_map()
-        trend_boost = 0.0
-        if len(price_hist) >= 3:
-            last_k = price_hist[-3:]
-            deltas = []
-            for t in range(1, len(last_k)):
-                prev_p = last_k[t - 1].get(g, 0.0)
-                cur_p = last_k[t].get(g, 0.0)
-                dp = cur_p - prev_p
-                if dp > 0:
-                    deltas.append(dp)
-            if deltas:
-                avg_step = sum(deltas) / len(deltas)
-                trend_boost = min(5.0 * avg_step, 0.3 * ref)
-
-        est = ref + trend_boost
-
-        est = max(est, float(p_now))
-        if base_v > 0:
-            cap_mult = 1.8 if self.is_national else 1.5
-            est = min(est, cap_mult * base_v)
-
-        return float(max(est, 0.0))
 
     def _neighbors(self, g):
+
         r, c = self.goods_to_idx[g]
         R, C = self.shape
         res = []
@@ -114,27 +69,31 @@ class MyAgent2(MyLSVMAgent):
         return res
 
     def _bundle_value(self, bundle):
+
         if not bundle:
             return 0.0
-        return float(self.calc_total_valuation(bundle))
+        return self.calc_total_valuation(bundle)
 
     def _bundle_value_without(self, bundle, g):
+
         if g not in bundle:
             return self._bundle_value(bundle)
         smaller = set(bundle)
         smaller.remove(g)
         return self._bundle_value(smaller)
 
+
     def _generate_national_bundles(self):
+
         vals = self.single_vals
-        sorted_goods = sorted(self.goods, key=lambda x: vals[x], reverse=True)
+        sorted_goods = sorted(self.goods, key=lambda g: vals[g], reverse=True)
         seeds = sorted_goods[:6]
 
         bundles = []
+
         for seed in seeds:
             bundle = {seed}
             current_value = self._bundle_value(bundle)
-
             while len(bundle) < 10:
                 candidates = set()
                 for g in bundle:
@@ -172,14 +131,17 @@ class MyAgent2(MyLSVMAgent):
             if f not in seen:
                 seen.add(f)
                 unique.append(b)
+
         for g in sorted_goods[:6]:
             unique.append({g})
 
         return unique
 
     def _generate_regional_bundles(self):
+
         vals = self.single_vals
         goods_in_prox = set(self.get_goods_in_proximity())
+
         if not goods_in_prox:
             goods_in_prox = set(self.goods)
 
@@ -191,6 +153,7 @@ class MyAgent2(MyLSVMAgent):
         seeds = positive_goods[:5]
 
         bundles = []
+
         for seed in seeds:
             bundle = {seed}
             current_value = self._bundle_value(bundle)
@@ -239,77 +202,43 @@ class MyAgent2(MyLSVMAgent):
         return unique
 
     def current_prices_map(self):
+
         price_history = self.get_price_history_map()
         if price_history:
             return price_history[-1]
         else:
             return {g: 0.0 for g in self.get_goods()}
 
-    def _update_aggressiveness(self):
-
-        current_prices = self.current_prices_map()
-        ratios = []
-        for g, p in current_prices.items():
-            ref = float(self.static_ref_price.get(g, 0.0))
-            if ref > 0:
-                ratios.append(p / ref)
-
-        if not ratios:
-            self.aggressiveness = 1.0
-            return
-
-        avg = sum(ratios) / len(ratios)
-
-        if self.is_national:
-            low, high = 0.8, 1.4
-        else:
-            low, high = 0.7, 1.3
-
-        self.aggressiveness = max(low, min(high, avg))
-
     def _choose_target_bundle(self):
 
         current_prices = self.current_prices_map()
 
-        risk_mult = 1.3 if self.is_national_bidder() else 1.15
+        risk_mult = 1.4 if self.is_national_bidder() else 1.2
 
-        scored = []
+        best_bundle = set()
+        best_score = 0.0
+
         for C in self.candidate_bundles:
             if not C:
                 continue
 
-            if self.is_national_bidder() and len(C) > 7:
+            if self.is_national_bidder() and len(C) > 6:
                 continue
 
-            vC = self._bundle_value(C)
-            if vC <= 0:
+            v = self._bundle_value(C)
+            if v <= 0:
                 continue
 
             cost_est = 0.0
             for g in C:
                 p_now = current_prices.get(g, 0.0)
-                est_final = self._estimate_final_price(g, p_now)
-                cost_est += est_final * self.aggressiveness
+                exp = self.expected_final_price.get(g, p_now)
+                eff_p = max(p_now, exp)
+                cost_est += eff_p
 
-            base_score = vC - risk_mult * cost_est
-            scored.append((base_score, C))
-
-        if not scored:
-            return set(), 0.0
-
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top_k = scored[:min(5, len(scored))]
-
-        seed = self.get_current_round() * 10007 + int(sum(current_prices.values()) * 10)
-        rnd = random.Random(seed)
-
-        best_bundle = set()
-        best_score = float("-inf")
-
-        for base_score, C in top_k:
-            noisy_score = base_score + rnd.uniform(-0.5, 0.5)
-            if noisy_score > best_score:
-                best_score = noisy_score
+            score = v - risk_mult * cost_est
+            if score > best_score:
+                best_score = score
                 best_bundle = C
 
         if self.current_target_bundle:
@@ -319,8 +248,8 @@ class MyAgent2(MyLSVMAgent):
 
         return best_bundle, best_score
 
-    def _bids_for_target_bundle(self, target_bundle):
 
+    def _bids_for_target_bundle(self, target_bundle):
         bids = {}
         if not target_bundle:
             return bids
@@ -329,41 +258,33 @@ class MyAgent2(MyLSVMAgent):
         current_prices = self.current_prices_map()
 
         total_v = self._bundle_value(target_bundle)
-        if total_v <= 0:
+        n = len(target_bundle)
+        if n == 0 or total_v <= 0:
             return {}
 
-        marginals = {}
-        for g in target_bundle:
-            without = self._bundle_value_without(target_bundle, g)
-            marginals[g] = max(total_v - without, 0.0)
+        risk_factor = 0.7 if self.is_national_bidder() else 0.8
+        per_cap = (total_v / n) * risk_factor
 
-        if self.is_national_bidder():
-            risk_factor = 0.75
-        else:
-            risk_factor = 0.8
-
-        early_round = (self.get_current_round() <= 60)
+        early_round = (self.get_current_round() <= 50)
 
         for g in target_bundle:
-            mb = float(min_bids[g])
-            cur_p = float(current_prices.get(g, 0.0))
-            m = float(marginals[g])
+            min_bid = min_bids[g]
+            cur_p = current_prices.get(g, 0.0)
 
-            if m <= 0 or m <= mb:
+            if per_cap <= min_bid:
                 continue
 
-            est_final = self._estimate_final_price(g, cur_p)
-
-            per_good_cap = risk_factor * m
-
             if early_round:
-                raw_target = min(est_final, per_good_cap)
-                bid_g = max(mb, raw_target)
-            else:
-                bid_g = mb
-            bid_g = min(bid_g, m)
 
-            if bid_g >= mb:
+                jump_target = min(min_bid + 2.0, per_cap)
+                bid_g = max(min_bid, jump_target)
+            else:
+
+                bid_g = min_bid
+
+            bid_g = min(bid_g, per_cap)
+
+            if bid_g >= min_bid:
                 bids[g] = bid_g
 
         bids = self.clip_bids(bids)
@@ -372,30 +293,31 @@ class MyAgent2(MyLSVMAgent):
         U_est = total_v - est_cost
 
         if self.is_national_bidder():
-            stop_loss = -3.0
+            stop_loss = -6.0
         else:
-            stop_loss = -1.5
+            stop_loss = -3.0
 
         if U_est < stop_loss:
             return {}
 
         return bids
 
+
+
     def national_bidder_strategy(self):
-        target, score = self._choose_target_bundle()
+        target, U = self._choose_target_bundle()
         self.current_target_bundle = set(target)
         bids = self._bids_for_target_bundle(self.current_target_bundle)
         return bids
 
     def regional_bidder_strategy(self):
-        target, score = self._choose_target_bundle()
+        target, U = self._choose_target_bundle()
         self.current_target_bundle = set(target)
         bids = self._bids_for_target_bundle(self.current_target_bundle)
         return bids
 
-    def get_bids(self):
 
-        self._update_aggressiveness()
+    def get_bids(self):
 
         if self.is_national_bidder():
             bids = self.national_bidder_strategy()
@@ -406,6 +328,7 @@ class MyAgent2(MyLSVMAgent):
             return bids
 
         safe_bids = {}
+
         tentative = self.get_tentative_allocation()
         if tentative:
             min_bids = self.get_min_bids(tentative)
@@ -419,6 +342,7 @@ class MyAgent2(MyLSVMAgent):
             safe_bids[best_g] = mb
 
         safe_bids = self.clip_bids(safe_bids)
+
         if self.is_valid_bid_bundle(safe_bids):
             return safe_bids
 
@@ -431,9 +355,8 @@ class MyAgent2(MyLSVMAgent):
 
         final_prices = self.current_prices_map()
         for g, p in final_prices.items():
-            MyAgent2.PRICE_HISTORY[g].append(float(p))
+            MyAgent2.PRICE_HISTORY[g].append(p)
         MyAgent2.GAMES_PLAYED += 1
-
 
 ################### SUBMISSION #####################
 my_agent_submission = MyAgent2(NAME)
@@ -497,7 +420,7 @@ if __name__ == "__main__":
     
     # Heres an example of how to process a singular file 
     # process_saved_game(path_from_local_root("saved_games/2024-04-08_17-36-34.json.gz"))
-    # or every file in a directory
+    # or every file in a directory 
     # process_saved_dir(path_from_local_root("saved_games"))
     
     ### DO NOT TOUCH THIS #####
@@ -506,14 +429,15 @@ if __name__ == "__main__":
         num_cycles_per_player = 3,
         timeout=1,
         local_save_path="saved_games",
-        players=[ 
+        players=[
             agent,
-            # MyAgent("CP - MyAgent"),
-            # MyAgent("CP2 - MyAgent"),
-            # MyAgent("CP3 - MyAgent"),
-            MinBidAgent("CP - MyAgent"), 
-            JumpBidder("CP2 - MyAgent"), 
-            TruthfulBidder("CP3 - MyAgent"), 
+            MyAgent2("CP - MyAgent"),
+            Scpp("..."),
+            MyAgent2("CP2 - MyAgent"),
+            #MyAgent2("CP3 - MyAgent"),
+            # MinBidAgent("CP - MyAgent"), 
+            # JumpBidder("CP2 - MyAgent"), 
+            # TruthfulBidder("CP3 - MyAgent"), 
             MinBidAgent("Min Bidder"), 
             JumpBidder("Jump Bidder"), 
             TruthfulBidder("Truthful Bidder"), 
