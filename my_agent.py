@@ -431,7 +431,7 @@ class MyAgent(MyLSVMAgent):
 
         final_prices = self.current_prices_map()
         for g, p in final_prices.items():
-            MyAgen.PRICE_HISTORY[g].append(float(p))
+            MyAgent.PRICE_HISTORY[g].append(float(p))
         MyAgent.GAMES_PLAYED += 1
 
 
