@@ -8,20 +8,29 @@ import os
 import random
 import gzip
 import json
+import math
+from independent_histogram import IndependentHistogram
 from collections import defaultdict
 from path_utils import path_from_local_root
 from scpp import Scpp
+from my_agent2 import MyAgent2
+from my_agent3 import MyAgent3
 
 
-NAME = "???"
+NAME = "??????"
+
 
 
 class MyAgent(MyLSVMAgent):
 
     PRICE_HISTORY = defaultdict(list)
     GAMES_PLAYED = 0
+    MAX_HISTORY_PER_GOOD = 15
+    BUCKET_SIZE = 1
+    BID_UPPER_BOUND = 30
+    GLOBAL_HIST = None
 
-    EPSILON = 0.1
+    EPSILON = 0
 
     def setup(self):
         self.round = 0
@@ -30,12 +39,10 @@ class MyAgent(MyLSVMAgent):
         self.shape = self.get_shape()
         self.goods_to_idx = self.get_goods_to_index()
         self.idx_to_good = {tuple(rc): g for g, rc in self.goods_to_idx.items()}
-
         self.single_vals = self.get_valuations()
         self._build_static_price_model()
         self.aggressiveness = 1.0
         self.current_target_bundle = set()
-
         if self.is_national:
             self.candidate_bundles = self._generate_national_bundles()
         else:
@@ -43,11 +50,9 @@ class MyAgent(MyLSVMAgent):
 
     def _build_static_price_model(self):
         self.static_ref_price = {}
-
         for g in self.goods:
             hist = MyAgent.PRICE_HISTORY[g]
             base_v = max(float(self.single_vals.get(g, 0.0)), 0.0)
-
             if hist:
                 h = sorted(hist)
                 n = len(h)
@@ -60,25 +65,17 @@ class MyAgent(MyLSVMAgent):
 
                 q50 = q(0.5)
                 q70 = q(0.7)
-                q90 = q(0.9)
-                ema = 0.7 * h[-1] + 0.3 * q50
-
-                ref = 0.4 * q50 + 0.4 * q70 + 0.2 * ema
-
+                ref = 0.7 * q50 + 0.3 * q70
                 if base_v > 0:
-                    cap_mult = 1.6 if self.is_national else 1.4
+                    cap_mult = 1.3 if self.is_national else 1.2
                     ref = min(ref, cap_mult * base_v)
-
                 self.static_ref_price[g] = float(max(ref, 0.0))
             else:
-
-                self.static_ref_price[g] = 0.8 * base_v
+                self.static_ref_price[g] = 0.9 * base_v
 
     def _estimate_final_price(self, g, p_now):
-
         base_v = max(float(self.single_vals.get(g, 0.0)), 0.0)
         ref = float(self.static_ref_price.get(g, base_v))
-
         price_hist = self.get_price_history_map()
         trend_boost = 0.0
         if len(price_hist) >= 3:
@@ -92,15 +89,12 @@ class MyAgent(MyLSVMAgent):
                     deltas.append(dp)
             if deltas:
                 avg_step = sum(deltas) / len(deltas)
-                trend_boost = min(5.0 * avg_step, 0.3 * ref)
-
+                trend_boost = min(3.0 * avg_step, 0.2 * ref)
         est = ref + trend_boost
-
         est = max(est, float(p_now))
         if base_v > 0:
-            cap_mult = 1.8 if self.is_national else 1.5
+            cap_mult = 1.4 if self.is_national else 1.3
             est = min(est, cap_mult * base_v)
-
         return float(max(est, 0.0))
 
     def _neighbors(self, g):
@@ -129,22 +123,18 @@ class MyAgent(MyLSVMAgent):
         vals = self.single_vals
         sorted_goods = sorted(self.goods, key=lambda x: vals[x], reverse=True)
         seeds = sorted_goods[:6]
-
         bundles = []
         for seed in seeds:
             bundle = {seed}
             current_value = self._bundle_value(bundle)
-
             while len(bundle) < 10:
                 candidates = set()
                 for g in bundle:
                     for nb in self._neighbors(g):
                         if nb not in bundle:
                             candidates.add(nb)
-
                 if not candidates:
                     break
-
                 best_nb = None
                 best_gain = 0.0
                 for nb in candidates:
@@ -155,16 +145,12 @@ class MyAgent(MyLSVMAgent):
                     if gain > best_gain:
                         best_gain = gain
                         best_nb = nb
-
                 if best_nb is None:
                     break
-
                 bundle.add(best_nb)
                 current_value += best_gain
-
                 if len(bundle) >= 4:
                     bundles.append(set(bundle))
-
         unique = []
         seen = set()
         for b in bundles:
@@ -174,7 +160,6 @@ class MyAgent(MyLSVMAgent):
                 unique.append(b)
         for g in sorted_goods[:6]:
             unique.append({g})
-
         return unique
 
     def _generate_regional_bundles(self):
@@ -182,29 +167,23 @@ class MyAgent(MyLSVMAgent):
         goods_in_prox = set(self.get_goods_in_proximity())
         if not goods_in_prox:
             goods_in_prox = set(self.goods)
-
         positive_goods = [g for g in goods_in_prox if vals[g] > 0]
         if not positive_goods:
             positive_goods = list(goods_in_prox)
-
         positive_goods.sort(key=lambda g: vals[g], reverse=True)
         seeds = positive_goods[:5]
-
         bundles = []
         for seed in seeds:
             bundle = {seed}
             current_value = self._bundle_value(bundle)
-
             while len(bundle) < 6:
                 candidates = set()
                 for g in bundle:
                     for nb in self._neighbors(g):
                         if nb in goods_in_prox and nb not in bundle:
                             candidates.add(nb)
-
                 if not candidates:
                     break
-
                 best_nb = None
                 best_gain = 0.0
                 for nb in candidates:
@@ -215,19 +194,14 @@ class MyAgent(MyLSVMAgent):
                     if gain > best_gain:
                         best_gain = gain
                         best_nb = nb
-
                 if best_nb is None:
                     break
-
                 bundle.add(best_nb)
                 current_value += best_gain
-
                 if 3 <= len(bundle) <= 6:
                     bundles.append(set(bundle))
-
         for g in seeds:
             bundles.append({g})
-
         unique = []
         seen = set()
         for b in bundles:
@@ -235,7 +209,6 @@ class MyAgent(MyLSVMAgent):
             if f not in seen:
                 seen.add(f)
                 unique.append(b)
-
         return unique
 
     def current_prices_map(self):
@@ -246,139 +219,110 @@ class MyAgent(MyLSVMAgent):
             return {g: 0.0 for g in self.get_goods()}
 
     def _update_aggressiveness(self):
-
         current_prices = self.current_prices_map()
         ratios = []
         for g, p in current_prices.items():
             ref = float(self.static_ref_price.get(g, 0.0))
             if ref > 0:
                 ratios.append(p / ref)
-
         if not ratios:
             self.aggressiveness = 1.0
             return
-
         avg = sum(ratios) / len(ratios)
-
         if self.is_national:
-            low, high = 0.8, 1.4
+            low, high = 0.9, 1.2
         else:
-            low, high = 0.7, 1.3
-
-        self.aggressiveness = max(low, min(high, avg))
+            low, high = 0.85, 1.15
+        target = max(low, min(high, avg))
+        self.aggressiveness = 0.5 * self.aggressiveness + 0.5 * target
 
     def _choose_target_bundle(self):
-
         current_prices = self.current_prices_map()
-
-        risk_mult = 1.3 if self.is_national_bidder() else 1.15
-
+        risk_mult = 1.15 if self.is_national_bidder() else 1.05
         scored = []
         for C in self.candidate_bundles:
             if not C:
                 continue
-
             if self.is_national_bidder() and len(C) > 7:
                 continue
-
             vC = self._bundle_value(C)
             if vC <= 0:
                 continue
-
             cost_est = 0.0
             for g in C:
                 p_now = current_prices.get(g, 0.0)
                 est_final = self._estimate_final_price(g, p_now)
                 cost_est += est_final * self.aggressiveness
-
             base_score = vC - risk_mult * cost_est
             scored.append((base_score, C))
-
         if not scored:
             return set(), 0.0
-
         scored.sort(key=lambda x: x[0], reverse=True)
         top_k = scored[:min(5, len(scored))]
-
         seed = self.get_current_round() * 10007 + int(sum(current_prices.values()) * 10)
         rnd = random.Random(seed)
-
         best_bundle = set()
         best_score = float("-inf")
-
         for base_score, C in top_k:
             noisy_score = base_score + rnd.uniform(-0.5, 0.5)
             if noisy_score > best_score:
                 best_score = noisy_score
                 best_bundle = C
-
         if self.current_target_bundle:
-            inter = set(best_bundle) & set(self.current_target_bundle)
-            if inter:
-                best_bundle = inter
-
+            old_bundle = set(self.current_target_bundle)
+            old_score = None
+            for s, C in scored:
+                if C == old_bundle:
+                    old_score = s
+                    break
+            if old_score is not None and old_score >= best_score - 1.0:
+                best_bundle = old_bundle
         return best_bundle, best_score
 
     def _bids_for_target_bundle(self, target_bundle):
-
         bids = {}
         if not target_bundle:
             return bids
-
         min_bids = self.get_min_bids()
         current_prices = self.current_prices_map()
-
         total_v = self._bundle_value(target_bundle)
         if total_v <= 0:
             return {}
-
         marginals = {}
         for g in target_bundle:
             without = self._bundle_value_without(target_bundle, g)
             marginals[g] = max(total_v - without, 0.0)
-
         if self.is_national_bidder():
             risk_factor = 0.75
         else:
             risk_factor = 0.8
-
-        early_round = (self.get_current_round() <= 60)
-
+        T = 150
+        t = min(self.get_current_round() + 1, T)
+        phase = t / float(T)
         for g in target_bundle:
             mb = float(min_bids[g])
             cur_p = float(current_prices.get(g, 0.0))
             m = float(marginals[g])
-
             if m <= 0 or m <= mb:
                 continue
-
             est_final = self._estimate_final_price(g, cur_p)
-
             per_good_cap = risk_factor * m
-
-            if early_round:
-                raw_target = min(est_final, per_good_cap)
-                bid_g = max(mb, raw_target)
-            else:
-                bid_g = mb
+            base_target = min(est_final, per_good_cap)
+            alpha = 0.6 + 0.4 * (1.0 - phase)
+            raw_target = alpha * base_target + (1.0 - alpha) * cur_p
+            bid_g = max(mb, raw_target)
             bid_g = min(bid_g, m)
-
             if bid_g >= mb:
                 bids[g] = bid_g
-
         bids = self.clip_bids(bids)
-
         est_cost = sum(bids.get(g, 0.0) for g in target_bundle)
         U_est = total_v - est_cost
-
         if self.is_national_bidder():
-            stop_loss = -3.0
+            stop_loss = -5.0
         else:
-            stop_loss = -1.5
-
+            stop_loss = -3.0
         if U_est < stop_loss:
             return {}
-
         return bids
 
     def national_bidder_strategy(self):
@@ -394,45 +338,112 @@ class MyAgent(MyLSVMAgent):
         return bids
 
     def get_bids(self):
-
         self._update_aggressiveness()
-
-        if self.is_national_bidder():
-            bids = self.national_bidder_strategy()
+        if random.random() < self.EPSILON:
+            vals = self.single_vals
+            best_g = max(self.goods, key=lambda g: vals[g])
+            mb = self.get_min_bids({best_g})[best_g]
+            bids = {best_g: mb}
         else:
-            bids = self.regional_bidder_strategy()
-
+            if self.is_national_bidder():
+                bids = self.national_bidder_strategy()
+            else:
+                bids = self.regional_bidder_strategy()
         if self.is_valid_bid_bundle(bids):
             return bids
-
         safe_bids = {}
         tentative = self.get_tentative_allocation()
         if tentative:
             min_bids = self.get_min_bids(tentative)
             for g, mb in min_bids.items():
                 safe_bids[g] = mb
-
         if not safe_bids and self.get_current_round() == 0:
             vals = self.single_vals
             best_g = max(self.goods, key=lambda g: vals[g])
             mb = self.get_min_bids({best_g})[best_g]
             safe_bids[best_g] = mb
-
         safe_bids = self.clip_bids(safe_bids)
         if self.is_valid_bid_bundle(safe_bids):
             return safe_bids
-
         return {}
 
     def update(self):
         pass
 
     def teardown(self):
-
         final_prices = self.current_prices_map()
         for g, p in final_prices.items():
-            MyAgent.PRICE_HISTORY[g].append(float(p))
+            lst = MyAgent.PRICE_HISTORY[g]
+            lst.append(float(p))
+            if len(lst) > MyAgent.MAX_HISTORY_PER_GOOD:
+                lst.pop(0)
         MyAgent.GAMES_PLAYED += 1
+
+
+my_agent_submission = MyAgent(NAME)
+
+
+def process_saved_game(filepath):
+    print(f"Processing: {filepath}")
+    with gzip.open(filepath, 'rt', encoding='UTF-8') as f:
+        game_data = json.load(f)
+        for agent, agent_data in game_data.items():
+            if agent_data['valuations'] is not None:
+                agent = agent
+                bid_history = agent_data['bid_history']
+                price_history = agent_data['price_history']
+                util_history = agent_data['util_history']
+                winner_history = agent_data['winner_history']
+                elo = agent_data['elo']
+                is_national_bidder = agent_data['is_national_bidder']
+                valuations = agent_data['valuations']
+                regional_good = agent_data['regional_good']
+
+
+def process_saved_dir(dirpath):
+    for filename in os.listdir(dirpath):
+        if filename.endswith('.json.gz'):
+            filepath = os.path.join(dirpath, filename)
+            process_saved_game(filepath)
+
+
+def preload_from_saved_dir(dirpath):
+    if not os.path.isdir(dirpath):
+        return
+    pre_hist = None
+    goods_order = None
+    bucket_sizes = None
+    max_bids = None
+    for filename in os.listdir(dirpath):
+        if not filename.endswith(".json.gz"):
+            continue
+        filepath = os.path.join(dirpath, filename)
+        try:
+            with gzip.open(filepath, "rt", encoding="UTF-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        for agent_name, agent_data in data.items():
+            price_history = agent_data.get("price_history", [])
+            if not price_history:
+                continue
+            last_prices = price_history[-1]
+            if not isinstance(last_prices, dict):
+                continue
+            if goods_order is None:
+                goods_order = sorted(last_prices.keys())
+                bucket_sizes = [MyAgent.BUCKET_SIZE] * len(goods_order)
+                max_bids = [MyAgent.BID_UPPER_BOUND] * len(goods_order)
+                pre_hist = IndependentHistogram(goods_order, bucket_sizes, max_bids)
+            pre_hist.add_record(last_prices)
+            for g, p in last_prices.items():
+                MyAgent.PRICE_HISTORY[g].append(float(p))
+    if pre_hist is not None:
+        if MyAgent.GLOBAL_HIST is None:
+            MyAgent.GLOBAL_HIST = pre_hist
+        else:
+            MyAgent.GLOBAL_HIST.update(pre_hist, 0.5)
+
 
 
 ################### SUBMISSION #####################
@@ -481,16 +492,48 @@ def process_saved_game(filepath):
             
             # TODO: If you are planning on learning from previously saved games enter your code below. 
             
-            
-        
-def process_saved_dir(dirpath): 
-    """ 
-     Here is some example code to load in all saved game in the format of a json.gz in a directory and to work with it
-    """
+def process_saved_dir(dirpath):
     for filename in os.listdir(dirpath):
         if filename.endswith('.json.gz'):
             filepath = os.path.join(dirpath, filename)
-            process_saved_game(filepath)
+            process_saved_game(filepath)           
+        
+def preload_from_saved_dir(dirpath):
+    if not os.path.isdir(dirpath):
+        return
+    pre_hist = None
+    goods_order = None
+    bucket_sizes = None
+    max_bids = None
+    for filename in os.listdir(dirpath):
+        if not filename.endswith(".json.gz"):
+            continue
+        filepath = os.path.join(dirpath, filename)
+        try:
+            with gzip.open(filepath, "rt", encoding="UTF-8") as f:
+                data = json.load(f)
+        except Exception:
+            continue
+        for agent_name, agent_data in data.items():
+            price_history = agent_data.get("price_history", [])
+            if not price_history:
+                continue
+            last_prices = price_history[-1]
+            if not isinstance(last_prices, dict):
+                continue
+            if goods_order is None:
+                goods_order = sorted(last_prices.keys())
+                bucket_sizes = [MyAgent.BUCKET_SIZE] * len(goods_order)
+                max_bids = [MyAgent.BID_UPPER_BOUND] * len(goods_order)
+                pre_hist = IndependentHistogram(goods_order, bucket_sizes, max_bids)
+            pre_hist.add_record(last_prices)
+            for g, p in last_prices.items():
+                MyAgent.PRICE_HISTORY[g].append(float(p))
+    if pre_hist is not None:
+        if MyAgent.GLOBAL_HIST is None:
+            MyAgent.GLOBAL_HIST = pre_hist
+        else:
+            MyAgent.GLOBAL_HIST.update(pre_hist, 0.5)
             
 
 if __name__ == "__main__":
@@ -501,6 +544,12 @@ if __name__ == "__main__":
     # process_saved_dir(path_from_local_root("saved_games"))
     
     ### DO NOT TOUCH THIS #####
+
+    try:
+        preload_from_saved_dir(path_from_local_root("saved_games"))
+    except Exception:
+        pass
+
     agent = MyAgent(NAME)
     arena = LSVMArena(
         num_cycles_per_player = 3,
@@ -508,12 +557,9 @@ if __name__ == "__main__":
         local_save_path="saved_games",
         players=[ 
             agent,
-            # MyAgent("CP - MyAgent"),
-            # MyAgent("CP2 - MyAgent"),
-            # MyAgent("CP3 - MyAgent"),
-            MinBidAgent("CP - MyAgent"), 
-            JumpBidder("CP2 - MyAgent"), 
-            TruthfulBidder("CP3 - MyAgent"), 
+            Scpp("Scpp"),
+            MyAgent2("CP2 - MyAgent2"),
+            MyAgent3("CP3 - MyAgent3"),
             MinBidAgent("Min Bidder"), 
             JumpBidder("Jump Bidder"), 
             TruthfulBidder("Truthful Bidder"), 
